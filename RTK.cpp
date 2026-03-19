@@ -8,62 +8,66 @@
 // 声明外部函数，如果已经有头文件包含请忽略
 extern void CommonTimeToMJDTime(const COMMONTIME* CT, MJDTIME* MJDT);
 extern void MJDTimeToGPSTime(const MJDTIME* MJDT, GPSTIME* GT);
-extern void GPSTimeToMJDTime(const GPSTIME* GT, MJDTIME* MJDT);
-extern void MJDTimeToCommonTime(const MJDTIME* MJDT, COMMONTIME* CT);
+void PrintEph(FILE* fp, GPSEPHREC* eph) {
+    if (!fp || !eph) return;
+    const char* tag = (eph->Sys == GPS) ? "GPSEPH" : "BDSEPH";
+    fprintf(fp, "%s PRN:%02d Week:%d TOC:%.3f a0: %22.15E a1: %22.15E a2: %22.15E TOE:%.3f dn: %22.15E M0: %22.15E SqrtA: %22.15E e: %22.15E OMEGA0: %22.15E i0: %22.15E omega: %22.15E idot: %22.15E OMGDot: %22.15E Crs: %22.15E Crc: %22.15E Cis: %22.15E Cic: %22.15E Cus: %22.15E Cuc: %22.15E Health: %d TGD: %22.15E\n",
+            tag, eph->PRN, eph->TOE.Week, eph->TOC.SecOfWeek,
+            eph->ClkBias, eph->ClkDrift, eph->ClkDriftRate,
+            eph->TOE.SecOfWeek, eph->DeltaN, eph->M0, eph->SqrtA, eph->e,
+            eph->OMEGA, eph->i0, eph->omega, eph->iDot, eph->OMEGADot,
+            eph->Crs, eph->Crc, eph->Cis, eph->Cic, eph->Cus, eph->Cuc,
+            eph->SVHealth, eph->TGD1);
+}
 
-int main()
+int main(int argc, char* argv[])
 {
-    // 测试代码保留原有的时间/坐标转换测试（可选，若需要可移至单独函数）
-    // 此处主要实现 NovAtel OEM7 二进制文件解码主逻辑
+    const wchar_t* fileName = L"OEM719原始数据/oem719-202603111200.bin"; 
+    FILE* fp = _wfopen(fileName, L"rb");
+    if (!fp) { wprintf(L"错误: 无法打开数据文件\n"); return -1; }
 
-    const char* fileName = "OEM7_Data.bin"; // 需确保目录下有此测试文件
-    FILE* fp = fopen(fileName, "rb");
-    if (!fp) {
-        printf("错误: 无法打开数据文件 %s\n", fileName);
-        return -1;
-    }
+    FILE* fout = fopen("result.txt", "w");
+    if (!fout) { printf("错误: 无法创建输出文件\n"); return -1; }
 
     unsigned char buff[MAXRAWLEN];
-    int len = 0; // 当前 buff 中有效字节数
-    
-    // 初始化数据存储结构
+    int len = 0;
     EPOCHOBS obs;
     GPSEPHREC geph[MAXGPSNUM], beph[MAXBDSNUM];
 
-    printf("开始读取并解码二进制文件: %s...\n", fileName);
+    printf("开始解析并生成统一日志 result.txt...\n");
 
     while (!feof(fp)) {
-        // 1. 读取数据到缓冲区 (从上次剩余的位置之后开始追加)
         int nRead = fread(buff + len, 1, MAXRAWLEN - len, fp);
         if (nRead <= 0) break;
         len += nRead;
 
-        // 2. 调用解码主调度函数
-        // 在文件模式下，DecodeNovOem7Dat 解码到一条观测值后会返回 1
         while (true) {
-            int ret = DecodeNovOem7Dat(buff, len, &obs, geph, beph);
+            int res = DecodeNovOem7Dat(buff, len, &obs, geph, beph);
+            if (res == 0) break;
 
-            if (ret == 1) { // 解码到历元观测值
-                printf(">>> 解码到一个历元: GPS Week=%d, SecOfWeek=%.3f, SatNum=%d\n",
-                        obs.Time.Week, obs.Time.SecOfWeek, obs.SatNum);
-                
-                // 此处可以衔接 SPP(观测值, 星历) 或 RTK 计算
-                // SPP(&obs, ...);
+            int msgID = res & 0xFFFF;
+            int prn   = (res >> 16) & 0xFF;
+
+            if (msgID == 43) { // RANGEB
+                fprintf(fout, "RANGE Week:%d Sec:%.3f SatNum:%d\n", obs.Time.Week, obs.Time.SecOfWeek, obs.SatNum);
+                for (int i = 0; i < obs.SatNum; i++) {
+                    fprintf(fout, "  PRN:%02d Sys:%d c1:%.3f l1:%.3f p2:%.3f l2:%.3f d1:%.3f d2:%.3f\n",
+                            obs.SatObs[i].Prn, (int)obs.SatObs[i].System,
+                            obs.SatObs[i].c1, obs.SatObs[i].l1, obs.SatObs[i].p2, obs.SatObs[i].l2,
+                            obs.SatObs[i].d1, obs.SatObs[i].d2);
+                }
             }
-            else if (ret == 2) { // 解码到星历
-                // 星历已更新在 geph/beph 中，继续循环解码 buff
-                continue; 
+            else if (msgID == 7) { // GPS星历
+                if (prn >= 1 && prn <= MAXGPSNUM) PrintEph(fout, &geph[prn-1]);
             }
-            else {
-                // 当前 buff 已无完整消息，退出内层循环去 fread 读更多数据
-                break;
+            else if (msgID == 1696) { // BDS星历
+                if (prn >= 1 && prn <= MAXBDSNUM) PrintEph(fout, &beph[prn-1]);
             }
         }
     }
 
-    fclose(fp);
-    printf("文件读取结束。\n");
-
+    fclose(fp); fclose(fout);
+    printf("处理完成！结果已存入 result.txt\n");
     return 0;
 }
 

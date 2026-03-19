@@ -1,5 +1,6 @@
 #include "RTK_Structs.h"
 #include <string.h>
+#include <math.h>
 
 // NovAtel CRC校验程序 (来自老师课件)
 #define POLYCRC32 0xEDB88320u
@@ -25,63 +26,53 @@ int DecodeNovOem7Dat(unsigned char Buff[], int& Len, EPOCHOBS* obs, GPSEPHREC ge
     // 循环扫描同步字符 0xAA 0x44 0x12
     while (i <= Len - 3) {
         if (Buff[i] == 0xAA && Buff[i+1] == 0x44 && Buff[i+2] == 0x12) {
-            // 找到同步头，检查剩余字节是否足够解码 28 字节消息头
             if (i + 28 > Len) break;
 
-            // 解码消息头中的 MsgID 和 MsgLen
             unsigned short msgID = *(unsigned short*)(Buff + i + 4);
             unsigned short msgLen = *(unsigned short*)(Buff + i + 8);
 
-            // 检查整条消息（头 28 + 体 msgLen + 尾 4 字节 CRC）是否完整
             int totalLen = 28 + msgLen + 4;
             if (i + totalLen > Len) break;
 
-            // CRC 校验
             unsigned int crcComputed = crc32(Buff + i, 28 + msgLen);
             unsigned int crcInMsg = *(unsigned int*)(Buff + i + 28 + msgLen);
 
             if (crcComputed != crcInMsg) {
-                // CRC 失败，跳过同步头继续搜索
                 i += 3;
                 continue;
             }
 
-            // CRC 通过，根据 MsgID 分发
+            int prn = 0;
             switch (msgID) {
                 case 43:   // RANGEB (二进制观测值)
-                    ret = decode_rangeb_oem7(Buff + i, obs);
+                    decode_rangeb_oem7(Buff + i, obs);
+                    ret = msgID; 
                     break;
                 case 7:    // GPSEPHEM (GPS星历)
-                    ret = decode_gpsephem(Buff + i, geph);
+                    decode_gpsephem(Buff + i, geph);
+                    prn = (int)(*(unsigned int*)(Buff + i + 28)); // 提取 PRN
+                    ret = (prn << 16) | 7; // 复合返回值
                     break;
                 case 1696: // BDSEPHEM (BDS星历)
-                    ret = decode_bdsephem(Buff + i, beph);
-                    break;
-                case 47:   // PSRPOS (定位结果)
-                    // ret = decode_psrpos(Buff + i, pos);
+                    decode_bdsephem(Buff + i, beph);
+                    prn = (int)(*(unsigned int*)(Buff + i + 28)); // 提取 PRN
+                    ret = (prn << 16) | 1696; // 复合返回值
                     break;
                 default:
-                    // 其他不需要的消息，忽略
                     break;
             }
 
-            // 处理完一条消息，移动指针到下一条可能的消息起始位置
             i += totalLen;
-
-            // 如果是观测值消息（文件模式），直接返回
-            if (ret == 1) break; 
+            if (ret != 0) break; 
         } else {
             i++;
         }
     }
 
-    // 循环结束后，处理剩余的不完整数据块
     if (i > 0) {
         int remaining = Len - i;
-        if (remaining > 0) {
-            memmove(Buff, Buff + i, remaining);
-        }
-        Len = remaining; // 更新 Len 供下次读文件拼接
+        if (remaining > 0) memmove(Buff, Buff + i, remaining);
+        Len = remaining;
     }
 
     return ret;
@@ -106,28 +97,28 @@ int decode_rangeb_oem7(unsigned char *buff, EPOCHOBS* obs) {
     // 3. 循环解析每一个信号通道
     for (unsigned int i = 0; i < nObs; i++) {
         unsigned short prn = *(unsigned short*)(ptr);
-        unsigned int status = *(unsigned int*)(ptr + 4);
-        double psr = *(double*)(ptr + 8);      // 伪距
-        double adr = -*(double*)(ptr + 20);     // 载波相位 (NovAtel ADR符号需取反)
-        float dopp = *(float*)(ptr + 32);      // 多普勒
-        float cno = *(float*)(ptr + 36);       // 载噪比
-        float lockTime = *(float*)(ptr + 40);  // 锁定时间
+        double psr = *(double*)(ptr + 4);                 // 伪距 (offset 4)
+        double adr = -*(double*)(ptr + 16);               // 载波相位 (offset 16)
+        float dopp = *(float*)(ptr + 28);                 // 多普勒 (offset 28)
+        float cno = *(float*)(ptr + 32);                  // 载噪比 (offset 32)
+        float lockTime = *(float*)(ptr + 36);             // 锁定时间 (offset 36)
+        unsigned int status = *(unsigned int*)(ptr + 40); // Tracking status (offset 40)
 
         // 解析 Tracking Status
         int sysId = (status >> 16) & 0x07;     // Bit 16-18: Satellite System
-        int sigType = (status >> 10) & 0x1F;   // Bit 10-14: Signal Type
+        int sigType = (status >> 21) & 0x1F;   // Bit 21-25: Signal Type
 
         GNSSSys sys = UNKS;
         int s = -1; // 频率索引：0=第一频率, 1=第二频率
 
         if (sysId == 0) { // GPS
             sys = GPS;
-            if (sigType == 0) s = 0;       // L1 C/A
-            else if (sigType == 16) s = 1; // L2 P(Y)
+            if (sigType == 0) s = 0;                                         // L1 C/A
+            else if (sigType == 5 || sigType == 9 || sigType == 17) s = 1;   // L2 P, L2 P(Y), L2 C
         } else if (sysId == 4) { // BDS
             sys = BDS;
-            if (sigType == 0) s = 0;       // B1I
-            else if (sigType == 2) s = 1;  // B3I
+            if (sigType == 0) s = 0;                                         // B1I
+            else if (sigType == 2 || sigType == 4 || sigType == 7) s = 1;    // B3I, B2I, B2a -> map to s=1 (p2, l2)
         }
 
         if (s == -1) { ptr += 44; continue; }

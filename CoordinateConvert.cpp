@@ -1,8 +1,7 @@
 #include "RTK_Structs.h"
 #include <cmath>
-#include <Eigen/Dense>
 
-using namespace Eigen;
+// 移除未使用的 Eigen 引用
 
 const double PI_CONST = 3.14159265358979323846;
 
